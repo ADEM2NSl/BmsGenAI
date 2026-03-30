@@ -1,0 +1,94 @@
+# ============================================================
+# docker-compose.yml
+# BMS GenAI Assistant — Full Local Stack
+# Run: docker-compose up -d
+# ============================================================
+
+version: "3.9"
+
+services:
+
+  # ── FastAPI Backend ──────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: bms_api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./outputs:/app/outputs
+    environment:
+      - SECRET_KEY=${SECRET_KEY:-bms-secret-key-2024}
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-mistral}
+      - DB_PATH=/app/data/bms.db
+      - CHROMA_PATH=/app/data/chroma_db
+      - UPLOADS_DIR=/app/data/uploads
+      - OUTPUTS_DIR=/app/outputs
+    depends_on:
+      - ollama
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Streamlit Dashboard ──────────────────────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dashboard
+    container_name: bms_dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      - API_URL=http://api:8000
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # ── Ollama (Local LLM) ───────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: bms_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: unless-stopped
+    # Uncomment for GPU support:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # ── File Watcher (CI/CD trigger) ─────────────────────────────
+  watcher:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: bms_watcher
+    command: python cicd/watcher.py
+    volumes:
+      - ./data:/app/data
+      - ./outputs:/app/outputs
+    environment:
+      - PIPELINE_TRIGGER_DIR=/app/data/uploads
+      - OLLAMA_HOST=http://ollama:11434
+    depends_on:
+      - api
+      - ollama
+    restart: unless-stopped
+
+volumes:
+  ollama_models:
+
+networks:
+  default:
+    name: bms_network
