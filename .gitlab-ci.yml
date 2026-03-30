@@ -1,0 +1,226 @@
+# ============================================================
+# .gitlab-ci.yml
+# BMS GenAI Assistant — CI/CD Pipeline
+# Runs on local GitLab Runner (no cloud needed)
+# ============================================================
+
+image: python:3.12-slim
+
+variables:
+  PIP_CACHE_DIR:    "$CI_PROJECT_DIR/.pip-cache"
+  DATA_DIR:         "$CI_PROJECT_DIR/data"
+  OUTPUTS_DIR:      "$CI_PROJECT_DIR/outputs"
+  OLLAMA_HOST:      "http://localhost:11434"
+  OLLAMA_MODEL:     "mistral"
+  PYTHONPATH:       "$CI_PROJECT_DIR"
+
+cache:
+  paths:
+    - .pip-cache/
+    - .venv/
+
+stages:
+  - validate
+  - nlp
+  - llm_generate
+  - ecu_tests
+  - coverage
+  - export
+  - notify
+
+# ── STAGE 1: Validate ─────────────────────────────────────────────────────────
+validate_requirements:
+  stage: validate
+  script:
+    - pip install pandas openpyxl pydantic loguru --quiet
+    - python -c "
+from backend.ingestion import BMSRequirementLoader
+import glob, sys
+
+files = glob.glob('data/uploads/*.xlsx')
+if not files:
+    print('No Excel files found in data/uploads/')
+    sys.exit(0)
+
+loader = BMSRequirementLoader()
+for f in files:
+    df = loader.load_excel(f)
+    result = loader.validate(df)
+    print(f'{f}: {result}')
+    if result[\"issues\"]:
+        print(f'WARNINGS: {result[\"issues\"]}')
+print('Validation complete ✅')
+"
+  artifacts:
+    reports:
+      junit: validation_report.xml
+    expire_in: 1 week
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_PIPELINE_SOURCE == "trigger"'
+
+# ── STAGE 2: NLP Pipeline ─────────────────────────────────────────────────────
+run_nlp_pipeline:
+  stage: nlp
+  script:
+    - pip install pandas openpyxl nltk spacy scikit-learn loguru --quiet
+    - python -m spacy download de_core_news_sm --quiet
+    - python -m spacy download en_core_web_sm --quiet
+    - python -c "
+import glob
+import pandas as pd
+from backend.ingestion import BMSRequirementLoader
+from nlp.pipeline import BMSNLPPipeline
+import json, os
+
+files = glob.glob('data/uploads/*.xlsx')
+if not files:
+    print('No files to process.')
+    exit(0)
+
+loader = BMSRequirementLoader()
+nlp    = BMSNLPPipeline()
+
+for f in files:
+    df = loader.load_excel(f)
+    df_enriched = nlp.run(df)
+    out = f'outputs/nlp_{os.path.basename(f).replace(\".xlsx\", \".json\")}'
+    os.makedirs('outputs', exist_ok=True)
+    df_enriched.to_json(out, orient='records', force_ascii=False)
+    print(f'NLP complete: {len(df_enriched)} requirements → {out}')
+    print(f'Critical: {df_enriched[\"is_critical\"].sum()}')
+"
+  artifacts:
+    paths:
+      - outputs/nlp_*.json
+    expire_in: 1 week
+  needs: [validate_requirements]
+
+# ── STAGE 3: LLM Generation ───────────────────────────────────────────────────
+llm_generate:
+  stage: llm_generate
+  script:
+    - pip install ollama chromadb sentence-transformers loguru --quiet
+    - python -c "
+import glob, json, os
+import pandas as pd
+from nlp.test_generator import BMSTestCaseGenerator
+from llm.generator import BMSLLMGenerator
+
+nlp_files = glob.glob('outputs/nlp_*.json')
+if not nlp_files:
+    print('No NLP output files found.')
+    exit(0)
+
+tc_gen = BMSTestCaseGenerator()
+llm    = BMSLLMGenerator()
+use_llm = llm.is_available()
+print(f'LLM available: {use_llm}')
+
+for f in nlp_files:
+    df = pd.read_json(f)
+    # Parse bms_entities back from string
+    if 'bms_entities' in df.columns:
+        df['bms_entities'] = df['bms_entities'].apply(
+            lambda x: json.loads(x) if isinstance(x, str) else x
+        )
+    df_unit, df_ecu = tc_gen.run(df)
+    base = os.path.basename(f).replace('nlp_', '').replace('.json', '')
+    df_unit.to_excel(f'outputs/unit_tcs_{base}.xlsx', index=False)
+    df_ecu.to_excel(f'outputs/ecu_tcs_{base}.xlsx', index=False)
+    print(f'Generated: {len(df_unit)} unit TCs, {len(df_ecu)} ECU TCs')
+"
+  artifacts:
+    paths:
+      - outputs/*_tcs_*.xlsx
+    expire_in: 1 week
+  needs: [run_nlp_pipeline]
+
+# ── STAGE 4: ECU Test Validation ──────────────────────────────────────────────
+validate_ecu_tests:
+  stage: ecu_tests
+  script:
+    - pip install pandas openpyxl loguru --quiet
+    - python -c "
+import glob
+import pandas as pd
+
+ecu_files = glob.glob('outputs/ecu_tcs_*.xlsx')
+for f in ecu_files:
+    df = pd.read_excel(f)
+    print(f'{f}: {len(df)} ECU TCs')
+    required_cols = ['TC_ID', 'Integration_Type_EN', 'Objective_EN',
+                     'Preconditions_EN', 'Expected_Result_EN', 'Priority']
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        print(f'  WARNING: Missing columns: {missing}')
+    else:
+        print(f'  ✅ All required columns present')
+    print(f'  Types: {df[\"Integration_Type_EN\"].value_counts().to_dict()}')
+"
+  needs: [llm_generate]
+
+# ── STAGE 5: Test Coverage Report ─────────────────────────────────────────────
+generate_coverage:
+  stage: coverage
+  script:
+    - pip install pandas openpyxl jinja2 loguru --quiet
+    - python cicd/generate_report.py
+  artifacts:
+    paths:
+      - outputs/coverage_report.html
+    expose_as: "Coverage Report"
+    expire_in: 2 weeks
+  needs: [validate_ecu_tests]
+
+# ── STAGE 6: Export ───────────────────────────────────────────────────────────
+export_artifacts:
+  stage: export
+  script:
+    - pip install pandas openpyxl xlsxwriter loguru --quiet
+    - python -c "
+import glob, os, shutil
+from datetime import datetime
+
+ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+out_dir = f'outputs/release_{ts}'
+os.makedirs(out_dir, exist_ok=True)
+
+for f in glob.glob('outputs/*.xlsx') + glob.glob('outputs/*.xml') + glob.glob('outputs/*.html'):
+    shutil.copy(f, out_dir)
+    print(f'Copied: {f}')
+print(f'Release package: {out_dir}')
+"
+  artifacts:
+    paths:
+      - outputs/release_*/
+    expire_in: 4 weeks
+  needs: [generate_coverage]
+
+# ── STAGE 7: Notify ───────────────────────────────────────────────────────────
+notify_engineers:
+  stage: notify
+  script:
+    - pip install requests loguru --quiet
+    - python -c "
+import os, glob
+import requests
+
+webhook = os.getenv('TEAMS_WEBHOOK_URL', '')
+pipeline_url = os.getenv('CI_PIPELINE_URL', 'N/A')
+ref = os.getenv('CI_COMMIT_REF_NAME', 'main')
+
+unit_files = glob.glob('outputs/unit_tcs_*.xlsx')
+ecu_files  = glob.glob('outputs/ecu_tcs_*.xlsx')
+
+msg = f'✅ BMS GenAI Pipeline Complete\nBranch: {ref}\nUnit TC files: {len(unit_files)}\nECU TC files: {len(ecu_files)}\nPipeline: {pipeline_url}'
+print(msg)
+
+if webhook:
+    requests.post(webhook, json={'text': msg}, timeout=10)
+    print('Teams notification sent.')
+else:
+    print('No Teams webhook configured — skipping notification.')
+"
+  needs: [export_artifacts]
+  allow_failure: true
